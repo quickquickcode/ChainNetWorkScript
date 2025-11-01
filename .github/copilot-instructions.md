@@ -1,24 +1,23 @@
 # Copilot Instructions
 
-## Project Overview
-- Goal: scripts under `ddos/` orchestrate Ethereum DDoS/malicious-transaction experiments to populate metrics described in `doc/参考.md`.
-- Runtime environment documented in `环境.md`; baseline is Python 3.12 with `web3`, `eth-account`, and networking tools (`tcpdump`, `iptables`).
-- Operational runbooks and expected manual steps live in `现有实现/命令.md`; treat missing scripts there as external dependencies, not repository bugs.
+## Overview
+- Project measures Ethereum node resilience (DDoS forwarding, malicious visibility) via Python CLIs; metric formulas live in `doc/参考.md`, `ddos/ddos评估.md`, and operational notes in `ddos/全新10.md`.
+- Scripts expect Geth 1.10.19 nodes under `/root/Work/PraviteChain`; setup, package baselines, and network diagnostics are documented in `环境.md`.
 
-## Key Components
-- `ddos/background_traffic_sender.py`: CLI that rotates unlocked accounts to emit legitimate transfers; expects IPC access (`--ipc`) and enforces non-zero positive integers via `positive_int` helper.
-- `ddos/ddos_attack_sender.py`: attack injector supporting IPC or HTTP RPC; can decrypt a keystore supplied through `ATTACKER_KEYSTORE` and always prints `export ATTACKER_ACCOUNTS=...` for downstream monitoring.
-- `ddos/ddos_monitor.py`: central monitor aggregating `txpool.content()` from local IPC and optional remote probes (`--legit-rpc`, `--attack-rpc`, `--supplement-rpc`); tracks nonce coverage per address to compute LTR/MTR in cumulative and sliding-window modes.
-- Metric formulas, terminology, and acceptance criteria are mirrored from the Chinese spec in `ddos/ddos评估.md` and `doc/参考.md`; keep console strings in Chinese when updating the monitor output.
+## Components & Patterns
+- `ddos/background_traffic_sender.py` rotates local accounts over IPC, enforces positive integers, unlocks upfront via personal API fallback, and logs `[BACKGROUND]` lines per send.
+- `ddos/ddos_attack_sender.py` drives attack bursts through IPC/HTTP, supports `ATTACKER_KEYSTORE` raw signing, prints `export ATTACKER_ACCOUNTS=...` (with a brief pause) before broadcasting, and defaults gas price to `max(gas_price/20, 1)`.
+- `ddos/ddos_monitor.py` polls `txpool.content()` locally plus optional probes (`--legit-rpc`, `--attack-rpc`, `--supplement-rpc`) to derive LTR/MTR; it keys off `ATTACKER_ACCOUNTS`, maintains sliding windows via `--window`, applies `--reject-delay`, and falls back to numerator totals to avoid zero-division. Preserve existing中文输出.
+- `malicious/malicious_trigger.py` mirrors the attack sender with tagged payloads (`--marker`), rejection modes (`dup_nonce` / `insufficient_funds` / `low_gas_limit`), optional JSONL logging, and the same keystore/unlock conventions.
+- `malicious/3.2.3.17恶意交易可识别性/detect_visibility.py` inspects txpool pending/queued across multiple providers, tracks per-transaction state transitions, and writes JSONL deltas consumed by `summarize_visibility.py` for VR/FR reporting.
 
-## Workflow Expectations
-- Typical sequence: start background sender ➜ start attack sender (capture and export attacker accounts) ➜ export `ATTACKER_ACCOUNTS` on monitoring node ➜ launch `ddos_monitor.py` with consistent window/poll settings ➜ optionally stream metrics to JSONL via `--output`.
-- `ddos_monitor.py` assumes attacker addresses come from `ATTACKER_ACCOUNTS`; when unset it treats every address as legitimate and prints a warning.
-- The monitor’s fallback logic replaces missing denominators with observed totals; preserve this to avoid zero-division crashes in air-gapped tests.
-- When adding new scripts, follow existing pattern: `argparse`-driven CLI, `Web3` provider selection, explicit account unlock flow with legacy fallback, and per-transaction logging of nonce/hash.
+## Workflows
+- DDoS measurement: run `background_traffic_sender.py` ➜ run `ddos_attack_sender.py` (capture its `ATTACKER_ACCOUNTS` export) ➜ export the variable on the monitoring host ➜ launch `ddos_monitor.py` with aligned `--window`/`--poll` and optional `--output` JSONL.
+- Malicious visibility: execute `malicious_trigger.py` to emit tagged traffic, then `detect_visibility.py` with the same marker and chosen IPC/RPC endpoints; optionally run `summarize_visibility.py visibility.jsonl` to aggregate VR/FR metrics.
+- Remote keystore workflow: keep JSON single-line in `ATTACKER_KEYSTORE`, supply passphrase via `--passphrase` (or prompt), and ensure geth exposes `personal` namespace as shown in `环境.md`.
 
-## Developer Notes
-- Use IPC paths rooted at `/root/Work/PraviteChain`; commands in `环境.md` show how nodes are launched (geth 1.10.19) and which APIs must be enabled (`personal`, `txpool`, `miner`).
-- Network troubleshooting steps (port checks, tcpdump filters) are spelled out in `环境.md`; reference them instead of inventing new diagnostics.
-- No automated tests; manual validation relies on live nodes plus the JSONL snapshots from the monitor.
-- Keep files ASCII by default; existing Chinese prose is acceptable in user-facing strings and docs but avoid introducing other encodings.
+## Conventions & Ops
+- All CLIs use `argparse`, helper validators (`positive_int`, `non_negative_int`), and per-transaction hash/nonce logging; mirror this structure for new tooling.
+- Web3 providers default to `IPCProvider(..., timeout=30)` or `HTTPProvider(..., request_kwargs={"timeout": 30})`; only adjust timeouts when following `环境.md` guidance.
+- Operational runbooks live in `现有实现/命令.md`; referenced scripts missing from the repo are external dependencies rather than defects.
+- There are no automated tests; validate changes against live nodes and JSONL snapshots, and keep files ASCII except where existing Chinese user strings appear.
