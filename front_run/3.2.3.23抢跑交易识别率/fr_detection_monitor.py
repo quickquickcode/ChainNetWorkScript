@@ -10,7 +10,9 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+from web3 import Web3
 
 PIPE_SCHEMA = "fr-trigger-tx-v1"
 GROUND_TRUTH_SCHEMA = "fr-trigger-event-v1"
@@ -56,6 +58,215 @@ class DetectionEntry:
     def runner_hash(self) -> Optional[str]:
         runner = self.raw.get("runner_hash")
         return str(runner) if runner else None
+
+
+@dataclass
+class ObservedTx:
+    tx_hash: str
+    from_address: Optional[str]
+    to_address: Optional[str]
+    nonce: int
+    gas_price: int
+    value: int
+    input_data: str
+    seen_at: float
+
+
+def parse_marker(value: str) -> bytes:
+    if not value.startswith("0x"):
+        raise argparse.ArgumentTypeError("marker must start with 0x")
+    body = value[2:]
+    if len(body) % 2:
+        raise argparse.ArgumentTypeError("marker hex length must be even")
+    try:
+        return bytes.fromhex(body)
+    except ValueError as exc:  # noqa: B904
+        raise argparse.ArgumentTypeError(f"invalid marker: {exc}") from exc
+
+
+def hex_to_int(value: object) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, bytes):
+        return int.from_bytes(value, "big")
+    if isinstance(value, str):
+        if value.startswith("0x"):
+            return int(value, 16)
+        return int(value)
+    if value is None:
+        return 0
+    raise TypeError(f"unsupported numeric: {value!r}")
+
+
+def connect_rpc(url: str) -> Web3:
+    provider = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 30}))
+    if not provider.is_connected():
+        raise SystemExit(f"failed to connect to RPC: {url}")
+    try:
+        provider.geth.txpool.content()
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(f"txpool namespace unavailable on {url}: {exc}") from exc
+    return provider
+
+
+def iter_txpool_entries(provider: Web3) -> Iterable[Dict[str, object]]:
+    content = provider.geth.txpool.content()
+    for section in ("pending", "queued"):
+        area = content.get(section, {}) or {}
+        for txs_by_nonce in area.values():
+            for entry in txs_by_nonce.values():
+                if isinstance(entry, list):
+                    for tx in entry:
+                        yield tx
+                else:
+                    yield entry
+
+
+def decode_marker(input_data: Optional[str], marker: bytes) -> Optional[Tuple[int, int]]:
+    if not input_data or not input_data.startswith("0x"):
+        return None
+    try:
+        payload = bytes.fromhex(input_data[2:])
+    except ValueError:
+        return None
+    if not payload.startswith(marker):
+        return None
+    suffix = payload[len(marker) :]
+    if len(suffix) < 5:
+        return None
+    role = suffix[0]
+    pair_id = int.from_bytes(suffix[1:5], "big")
+    return role, pair_id
+
+
+def is_candidate_match(victim: ObservedTx, runner: ObservedTx, window: float, ratio: float, absolute: int) -> bool:
+    delay = max(0.0, runner.seen_at - victim.seen_at)
+    if delay > window:
+        return False
+    if victim.to_address != runner.to_address:
+        return False
+    if victim.value != runner.value:
+        return False
+    if runner.gas_price <= victim.gas_price:
+        return False
+    premium = runner.gas_price - victim.gas_price
+    victim_gp = max(victim.gas_price, 1)
+    if premium < absolute and (runner.gas_price / victim_gp) < ratio:
+        return False
+    return True
+
+
+def build_detection_payload(
+    pair_id: int,
+    victim: ObservedTx,
+    runner: ObservedTx,
+    states: Dict[int, EventRecord],
+) -> Dict[str, object]:
+    record = {
+        "schema": DETECTION_SCHEMA,
+        "pair_id": pair_id,
+        "victim_hash": victim.tx_hash,
+        "runner_hash": runner.tx_hash,
+        "victim_gas_price": victim.gas_price,
+        "runner_gas_price": runner.gas_price,
+        "detected_delay": max(0.0, runner.seen_at - victim.seen_at),
+        "timestamp": time.time(),
+    }
+    state = states.get(pair_id)
+    if state and state.event_id:
+        record["event_id"] = state.event_id
+    if state and state.target_address:
+        record["target_address"] = state.target_address
+    return record
+
+
+def cleanup_candidates(
+    candidates: Dict[int, ObservedTx],
+    now: float,
+    ttl: float,
+    detected_pairs: Set[int],
+) -> None:
+    for pair_id, obs in list(candidates.items()):
+        if pair_id in detected_pairs or now - obs.seen_at > ttl:
+            candidates.pop(pair_id, None)
+
+
+def cleanup_seen_hashes(seen: Dict[str, float], now: float, ttl: float) -> None:
+    for tx_hash, ts in list(seen.items()):
+        if now - ts > ttl:
+            seen.pop(tx_hash, None)
+
+
+def run_detection(
+    provider: Web3,
+    marker: bytes,
+    seen_hashes: Dict[str, float],
+    victims: Dict[int, ObservedTx],
+    runners: Dict[int, ObservedTx],
+    detected_pairs: Set[int],
+    states: Dict[int, EventRecord],
+    pending: List[DetectionEntry],
+    allow_partial: bool,
+    detection_fp,
+    window: float,
+    ratio: float,
+    absolute: int,
+) -> None:
+    try:
+        entries = list(iter_txpool_entries(provider))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] failed to read txpool: {exc}")
+        return
+    for tx in entries:
+        tx_hash = tx.get("hash")
+        if not tx_hash:
+            continue
+        tx_hash = str(tx_hash).lower()
+        if tx_hash in seen_hashes:
+            continue
+        seen_time = time.time()
+        seen_hashes[tx_hash] = seen_time
+        role_pair = decode_marker(tx.get("input") or tx.get("data"), marker)
+        if not role_pair:
+            continue
+        role, pair_id = role_pair
+        if pair_id <= 0 or role not in (1, 2):
+            continue
+        observed = ObservedTx(
+            tx_hash=tx_hash,
+            from_address=tx.get("from"),
+            to_address=tx.get("to"),
+            nonce=hex_to_int(tx.get("nonce")),
+            gas_price=hex_to_int(tx.get("gasPrice")),
+            value=hex_to_int(tx.get("value")),
+            input_data=str(tx.get("input") or tx.get("data") or ""),
+            seen_at=seen_time,
+        )
+        if role == 1:
+            victims[pair_id] = observed
+        else:
+            runners[pair_id] = observed
+
+        if pair_id in detected_pairs:
+            continue
+        victim = victims.get(pair_id)
+        runner = runners.get(pair_id)
+        if not victim or not runner:
+            continue
+        if not is_candidate_match(victim, runner, window, ratio, absolute):
+            continue
+        detection_payload = build_detection_payload(pair_id, victim, runner, states)
+        apply_detection([detection_payload], pending, states, allow_partial)
+        detected_pairs.add(pair_id)
+        if detection_fp:
+            detection_fp.write(json.dumps(detection_payload, ensure_ascii=True) + "\n")
+            detection_fp.flush()
+        print(
+            f"[DETECT] pair={pair_id} victim={victim.tx_hash} runner={runner.tx_hash} "
+            f"delay={detection_payload['detected_delay']:.3f}s"
+        )
+        victims.pop(pair_id, None)
+        runners.pop(pair_id, None)
 
 
 class JsonlFollower:
@@ -195,18 +406,53 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Monitor detection coverage for front-running")
     parser.add_argument("--pipe", type=Path, required=True, help="FIFO path emitted by trigger")
     parser.add_argument("--ground-truth", type=Path, required=True, help="Ground-truth JSONL file")
-    parser.add_argument("--detections", type=Path, required=True, help="Detection engine JSONL output")
+    parser.add_argument("--rpc", required=True, help="HTTP RPC endpoint for txpool polling")
+    parser.add_argument("--marker", default="0xfeedface", help="Marker prefix used by trigger payloads")
+    parser.add_argument("--poll-interval", type=float, default=1.0, help="Seconds between txpool polls")
+    parser.add_argument("--detection-window", type=float, default=10.0, help="Max seconds between victim and runner")
+    parser.add_argument("--premium-ratio", type=float, default=1.1, help="Minimum runner/victim gas-price ratio")
+    parser.add_argument(
+        "--premium-absolute",
+        type=int,
+        default=5_000_000_000,
+        help="Minimum runner-victim gas-price delta in wei",
+    )
+    parser.add_argument(
+        "--candidate-ttl",
+        type=float,
+        default=30.0,
+        help="Seconds to retain unmatched candidate transactions",
+    )
+    parser.add_argument(
+        "--hash-ttl",
+        type=float,
+        default=300.0,
+        help="Seconds to retain seen tx hashes for deduplication",
+    )
     parser.add_argument("--allow-partial", action="store_true", help="Allow victim-only matches when unique")
     parser.add_argument("--status-interval", type=float, default=10.0, help="Seconds between status prints")
     parser.add_argument("--output", type=Path, help="JSONL file for unmatched events")
+    parser.add_argument("--detection-output", type=Path, help="JSONL file for detected events")
     args = parser.parse_args()
 
     states: Dict[int, EventRecord] = {}
     gt_follower = JsonlFollower(args.ground_truth)
-    det_follower = JsonlFollower(args.detections)
     pending: List[DetectionEntry] = []
 
+    try:
+        marker_bytes = parse_marker(args.marker)
+    except argparse.ArgumentTypeError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    provider = connect_rpc(args.rpc)
+
+    victim_candidates: Dict[int, ObservedTx] = {}
+    runner_candidates: Dict[int, ObservedTx] = {}
+    detected_pairs: Set[int] = set()
+    seen_hashes: Dict[str, float] = {}
+
     output_fp = ensure_output(args.output)
+    detection_fp = ensure_output(args.detection_output)
 
     stop_flag = threading.Event()
     pipe_queue: "queue.Queue[Dict[str, object]]" = queue.Queue()
@@ -217,7 +463,6 @@ def main() -> None:
 
     try:
         apply_ground_truth(gt_follower.read_new(), states)
-        apply_detection(det_follower.read_new(), pending, states, args.allow_partial)
         retry_pending(pending, states, args.allow_partial)
         while True:
             while True:
@@ -227,10 +472,28 @@ def main() -> None:
                     break
                 apply_pipe(payload, states)
             apply_ground_truth(gt_follower.read_new(), states)
-            apply_detection(det_follower.read_new(), pending, states, args.allow_partial)
+            run_detection(
+                provider,
+                marker_bytes,
+                seen_hashes,
+                victim_candidates,
+                runner_candidates,
+                detected_pairs,
+                states,
+                pending,
+                args.allow_partial,
+                detection_fp,
+                args.detection_window,
+                args.premium_ratio,
+                args.premium_absolute,
+            )
             retry_pending(pending, states, args.allow_partial)
 
             now = time.time()
+            cleanup_candidates(victim_candidates, now, args.candidate_ttl, detected_pairs)
+            cleanup_candidates(runner_candidates, now, args.candidate_ttl, detected_pairs)
+            cleanup_seen_hashes(seen_hashes, now, args.hash_ttl)
+
             if now - last_status >= args.status_interval:
                 last_status = now
                 truth_states = [state for state in states.values() if state.event_id]
@@ -238,9 +501,10 @@ def main() -> None:
                 detected = sum(1 for state in truth_states if state.detected)
                 coverage = detected / total if total else 0.0
                 print(
-                    f"[STATUS] total={total} detected={detected} coverage={coverage:.3f} pending={len(pending)}"
+                    f"[STATUS] total={total} detected={detected} coverage={coverage:.3f} "
+                    f"pending={len(pending)} victims={len(victim_candidates)} runners={len(runner_candidates)}"
                 )
-            time.sleep(1.0)
+            time.sleep(max(args.poll_interval, 0.1))
     except KeyboardInterrupt:
         pass
     finally:
@@ -249,29 +513,40 @@ def main() -> None:
         truth_states = [state for state in states.values() if state.event_id]
         total = len(truth_states)
         detected = sum(1 for state in truth_states if state.detected)
-        coverage = detected / total if total else 0.0
-        print(f"[SUMMARY] total={total} detected={detected} coverage={coverage:.3f}")
-
         missed = [state for state in truth_states if not state.detected]
-        if output_fp and missed:
-            for state in missed:
-                payload = {
-                    "pair_id": state.pair_id,
-                    "event_id": state.event_id,
-                    "victim_hash": state.victim_hash,
-                    "runner_hash": state.runner_hash,
-                    "target_address": state.target_address,
-                    "first_seen": state.first_seen,
-                    "timestamp": time.time(),
-                }
-                output_fp.write(json.dumps(payload, ensure_ascii=True) + "\n")
-            output_fp.flush()
+        missed_count = len(missed)
+        extra_count = len(pending)
+        coverage = detected / total if total else 0.0
+        print(
+            f"[SUMMARY] total={total} detected={detected} missed={missed_count} "
+            f"coverage={coverage:.3f}"
+        )
+
+        if extra_count:
+            print(f"[SUMMARY] unmatched_detection_entries={extra_count}")
+
+        if output_fp:
+            if missed:
+                for state in missed:
+                    payload = {
+                        "pair_id": state.pair_id,
+                        "event_id": state.event_id,
+                        "victim_hash": state.victim_hash,
+                        "runner_hash": state.runner_hash,
+                        "target_address": state.target_address,
+                        "first_seen": state.first_seen,
+                        "timestamp": time.time(),
+                    }
+                    output_fp.write(json.dumps(payload, ensure_ascii=True) + "\n")
+                output_fp.flush()
+                print(f"[SUMMARY] missed events written to {args.output}")
             output_fp.close()
-        elif output_fp:
-            output_fp.close()
+
+        if detection_fp:
+            detection_fp.close()
 
         if pending:
-            print(f"[WARN] {len(pending)} detection entries unmatched; treat as false positives")
+            print(f"[WARN] {extra_count} detection entries unmatched; treat as false positives")
             for entry in pending[:10]:
                 print(f"  - raw={entry.raw}")
 
