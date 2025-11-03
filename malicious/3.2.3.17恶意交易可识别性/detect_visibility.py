@@ -1,148 +1,76 @@
 #!/usr/bin/env python3
-"""Monitor tagged malicious transactions to derive visibility metrics."""
+"""基于 input 标记统计恶意交易识别指标。"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set
 
 from web3 import Web3
-from web3.exceptions import TransactionNotFound
 from web3.types import TxData
 
 
-@dataclass
-class TxRecord:
-    tx_hash: str
-    sender: str
-    nonce: int
-    first_seen: float
-    last_seen: float
-    status: str = "observed"
-    reason: Optional[str] = None
-    flag_time: Optional[float] = None
-    receipt_status: Optional[int] = None
-    sources: Set[str] = field(default_factory=set)
-    last_write_version: int = 0
-    version: int = 0
-
-    def touch(self, timestamp: float, source: str) -> None:
-        self.last_seen = timestamp
-        self.sources.add(source)
-
-    def mark_status(self, status: str, timestamp: float, reason: Optional[str] = None) -> None:
-        if self.status == status and (reason is None or reason == self.reason):
-            return
-        self.status = status
-        if reason is not None:
-            self.reason = reason
-        if status in {"rejected", "mined", "mined_failed"}:
-            self.flag_time = timestamp
-        self.version += 1
-
-    def set_receipt(self, status: int, timestamp: float) -> None:
-        if self.receipt_status == status:
-            return
-        self.receipt_status = status
-        if status == 1:
-            self.mark_status("mined", timestamp, self.reason)
-        else:
-            self.mark_status("mined_failed", timestamp, self.reason)
-
-    def bump(self) -> None:
-        self.version += 1
-
-    def to_payload(self, timestamp: float) -> dict:
-        return {
-            "timestamp": timestamp,
-            "tx_hash": self.tx_hash,
-            "from": self.sender,
-            "nonce": self.nonce,
-            "first_seen": self.first_seen,
-            "last_seen": self.last_seen,
-            "status": self.status,
-            "flag_time": self.flag_time,
-            "receipt_status": self.receipt_status,
-            "reason": self.reason,
-            "sources": sorted(self.sources),
-        }
-
-
 class Provider:
+    """封装 RPC/IPC 访问，优先使用 pending 块获取交易。"""
+
     def __init__(self, label: str, w3: Web3) -> None:
         self.label = label
         self.w3 = w3
 
-    def iter_txpool_transactions(self) -> Iterable[TxData]:
-        raw = self.w3.geth.txpool.content()
-        for section in ("pending", "queued"):
-            bucket = raw.get(section, {})
-            for _, nonce_map in bucket.items():
-                for _, entries in nonce_map.items():
-                    for entry in entries:
-                        yield entry
-
-    def get_inspect_reason(self, sender: str, nonce: int) -> Optional[str]:
+    def iter_pending_transactions(self) -> Iterable[TxData]:
+        yielded: Set[str] = set()
+        # 1) 尝试调用 eth_pendingTransactions（部分节点支持）
         try:
-            inspect = self.w3.geth.txpool.inspect()
+            pending_list = self.w3.manager.request_blocking("eth_pendingTransactions", [])
         except Exception:  # noqa: BLE001
-            return None
-        bucket = inspect.get("queued", {}).get(sender.lower(), {})
-        if not bucket:
-            bucket = inspect.get("pending", {}).get(sender.lower(), {})
-        if not bucket:
-            return None
-        key = hex(nonce)
-        reason = bucket.get(key)
-        if isinstance(reason, str):
-            return reason
-        return None
+            pending_list = []
+        for tx in pending_list or []:
+            payload = dict(tx)
+            tx_hash = payload.get("hash")
+            if not tx_hash:
+                continue
+            tx_hash = str(tx_hash).lower()
+            if tx_hash in yielded:
+                continue
+            yielded.add(tx_hash)
+            yield payload
+
+        # 2) 回退到 pending block
+        try:
+            block = self.w3.eth.get_block("pending", full_transactions=True)
+        except Exception:  # noqa: BLE001
+            block = None
+        if block:
+            for tx in block.get("transactions", []):
+                payload = dict(tx)
+                tx_hash = payload.get("hash")
+                if not tx_hash:
+                    continue
+                tx_hash = str(tx_hash).lower()
+                if tx_hash in yielded:
+                    continue
+                yielded.add(tx_hash)
+                yield payload
+
+    def collect_pending(self) -> List[TxData]:
+        return list(self.iter_pending_transactions())
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Detect visibility of tagged malicious transactions")
-    parser.add_argument("--marker", default="0xdeaddead", help="Hex prefix used to tag malicious transactions")
-    parser.add_argument("--poll", type=float, default=2.0, help="Polling interval in seconds (default: 2.0)")
-    parser.add_argument(
-        "--reject-window",
-        type=float,
-        default=10.0,
-        help="Seconds after last observation to treat a transaction as rejected (default: 10)",
-    )
-    parser.add_argument("--output", help="Optional JSONL path to record observations")
-    parser.add_argument("--ipc", action="append", help="IPC endpoints to monitor (can be repeated)")
-    parser.add_argument("--rpc", action="append", help="RPC endpoints to monitor (can be repeated)")
-    parser.add_argument(
-        "--summary-interval",
-        type=int,
-        default=30,
-        help="Seconds between console summary outputs (default: 30)",
-    )
+    parser = argparse.ArgumentParser(description="基于 input 标记统计恶意交易识别指标")
+    parser.add_argument("--marker", default="0xdeaddead", help="恶意交易 input 标记前缀")
+    parser.add_argument("--poll", type=float, default=2.0, help="轮询时间间隔，单位秒")
+    parser.add_argument("--output", help="可选：JSONL 输出文件，用于记录观测事件")
+    parser.add_argument("--ground-truth", help="可选：ground-truth 哈希文件（纯文本或 JSONL）")
+    parser.add_argument("--ipc", action="append", help="IPC 端点，可重复指定")
+    parser.add_argument("--rpc", action="append", help="HTTP RPC 端点，可重复指定")
     return parser.parse_args()
-
-
-def connect_providers(args: argparse.Namespace) -> List[Provider]:
-    endpoints: List[Provider] = []
-    ipc_list = args.ipc or []
-    rpc_list = args.rpc or []
-    if not ipc_list and not rpc_list:
-        raise SystemExit("At least one --ipc or --rpc endpoint is required")
-    for path in ipc_list:
-        w3 = Web3(Web3.IPCProvider(path, timeout=30))
-        if not w3.is_connected():
-            raise SystemExit(f"Failed to connect to IPC {path}")
-        endpoints.append(Provider(label=f"ipc:{path}", w3=w3))
-    for url in rpc_list:
-        w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 30}))
-        if not w3.is_connected():
-            raise SystemExit(f"Failed to connect to RPC {url}")
-        endpoints.append(Provider(label=f"rpc:{url}", w3=w3))
-    return endpoints
 
 
 def normalize_marker(marker: str) -> str:
@@ -152,34 +80,131 @@ def normalize_marker(marker: str) -> str:
     try:
         bytes.fromhex(marker[2:])
     except ValueError as exc:  # noqa: NIV001
-        raise SystemExit(f"Marker must be valid hex: {exc}") from exc
+        raise SystemExit(f"标记必须是合法十六进制：{exc}") from exc
     return marker
 
 
-def marker_matches(marker: str, data: str) -> bool:
-    try:
-        return data.lower().startswith(marker)
-    except AttributeError:
-        return False
+def connect_providers(args: argparse.Namespace) -> List[Provider]:
+    providers: List[Provider] = []
+    ipc_list = args.ipc or []
+    rpc_list = args.rpc or []
+    if not ipc_list and not rpc_list:
+        raise SystemExit("至少需要提供一个 --ipc 或 --rpc 端点")
+    for ipc_path in ipc_list:
+        w3 = Web3(Web3.IPCProvider(ipc_path, timeout=30))
+        if not w3.is_connected():
+            raise SystemExit(f"无法连接 IPC: {ipc_path}")
+        providers.append(Provider(label=f"ipc:{ipc_path}", w3=w3))
+    for rpc_url in rpc_list:
+        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 30}))
+        if not w3.is_connected():
+            raise SystemExit(f"无法连接 RPC: {rpc_url}")
+        providers.append(Provider(label=f"rpc:{rpc_url}", w3=w3))
+    return providers
 
 
 def ensure_output(path: Optional[str]):
     if not path:
         return None
-    file_path = Path(path)
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    return file_path.open("a", encoding="utf-8")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target.open("a", encoding="utf-8")
 
 
-def log_summary(records: Dict[str, TxRecord]) -> None:
-    total = len(records)
-    rejected = sum(1 for rec in records.values() if rec.status == "rejected")
-    mined = sum(1 for rec in records.values() if rec.status == "mined")
-    failed = sum(1 for rec in records.values() if rec.status == "mined_failed")
-    print(
-        f"[VISIBILITY] total={total} rejected={rejected} mined={mined} mined_failed={failed}",
-        flush=True,
-    )
+TX_HASH_RE = re.compile(r"0x[a-fA-F0-9]{64}")
+
+
+def load_ground_truth(path: Optional[str]) -> Optional[Set[str]]:
+    if not path:
+        return None
+    hashes: Set[str] = set()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                item = line.strip()
+                if not item:
+                    continue
+                if item.startswith("{"):
+                    try:
+                        info = json.loads(item)
+                        item = info.get("tx_hash") or info.get("hash") or info.get("txHash")
+                    except Exception:  # noqa: BLE001
+                        item = None
+                if isinstance(item, bytes):
+                    try:
+                        item = Web3.to_hex(item)
+                    except Exception:  # noqa: BLE001
+                        item = None
+                if isinstance(item, str) and not item.startswith("0x"):
+                    match = TX_HASH_RE.search(item)
+                    item = match.group(0) if match else None
+                if item:
+                    hashes.add(str(item).lower())
+    except Exception as exc:  # noqa: BLE001
+        print(f"[VISIBILITY] Warning: ground-truth 读取失败：{exc}", file=sys.stderr)
+    return hashes
+
+
+def marker_matches(marker: str, data: str) -> bool:
+    if data is None:
+        return False
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        data = "0x" + bytes(data).hex()
+    else:
+        data = str(data)
+    data = data.lower()
+    return data.startswith(marker)
+
+
+def write_event(handle, timestamp: float, tx_hash: str, kind: str, source: str) -> None:
+    payload: Dict[str, object] = {
+        "timestamp": timestamp,
+        "tx_hash": tx_hash,
+        "event": kind,
+        "source": source,
+    }
+    json.dump(payload, handle, ensure_ascii=False)
+    handle.write("\n")
+    handle.flush()
+
+
+def compute_metrics(
+    ground_truth: Optional[Set[str]],
+    observed_all: Set[str],
+    observed_marked: Set[str],
+) -> Dict[str, Optional[float]]:
+    if ground_truth is not None and ground_truth:
+        T_n = len(ground_truth)
+        A_n = sum(1 for h in ground_truth if h in observed_marked)
+        N_n = T_n - A_n
+        P_n = sum(1 for h in observed_marked if h not in ground_truth)
+    else:
+        ground_truth = None  # 方便后续判断
+        T_n = len(observed_marked)
+        A_n = T_n
+        N_n = 0
+        P_n = 0
+    C_n = len([h for h in observed_all if h not in observed_marked])
+
+    DC = (A_n / T_n) if T_n else None
+    AFP = (P_n / C_n) if C_n else None
+    AFN = (N_n / T_n) if T_n else None
+
+    return {
+        "ground_truth": ground_truth is not None,
+        "T_n": T_n,
+        "A_n": A_n,
+        "N_n": N_n,
+        "P_n": P_n,
+        "C_n": C_n,
+        "DC": DC,
+        "AFP": AFP,
+        "AFN": AFN,
+    }
+
+
+def format_ratio(value: Optional[float]) -> str:
+    return f"{value:.4f}" if isinstance(value, float) else "-"
 
 
 def main() -> None:
@@ -187,81 +212,68 @@ def main() -> None:
     marker = normalize_marker(args.marker)
     providers = connect_providers(args)
     output_handle = ensure_output(args.output)
-    records: Dict[str, TxRecord] = {}
-    last_summary = time.time()
+    observed_all: Set[str] = set()
+    observed_marked: Set[str] = set()
+    written_observed: Set[str] = set()
+    written_marked: Set[str] = set()
 
     try:
-        while True:
-            now = time.time()
-            for provider in providers:
-                try:
-                    for tx in provider.iter_txpool_transactions():
-                        data_field = tx.get("input") or tx.get("data") or "0x"
-                        if not marker_matches(marker, data_field):
-                            continue
+        with ThreadPoolExecutor(max_workers=len(providers)) as pool:
+            while True:
+                now = time.time()
+                future_map = {pool.submit(provider.collect_pending): provider for provider in providers}
+                for future in as_completed(future_map):
+                    provider = future_map[future]
+                    try:
+                        transactions = future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[VISIBILITY] Warning: 查询 {provider.label} 失败：{exc}", file=sys.stderr)
+                        continue
+
+                    for tx in transactions:
                         tx_hash = tx.get("hash")
-                        if not tx_hash:
-                            continue
                         if isinstance(tx_hash, bytes):
                             tx_hash = Web3.to_hex(tx_hash)
-                        sender = tx.get("from") or ""
-                        sender = Web3.to_checksum_address(sender) if sender else sender
-                        nonce = int(tx.get("nonce", 0))
-                        record = records.get(tx_hash)
-                        if record is None:
-                            record = TxRecord(
-                                tx_hash=tx_hash,
-                                sender=sender,
-                                nonce=nonce,
-                                first_seen=now,
-                                last_seen=now,
-                            )
-                            records[tx_hash] = record
-                            record.version += 1
-                        record.touch(now, provider.label)
-                        record.mark_status("pool", now)
-                        reason = provider.get_inspect_reason(sender, nonce)
-                        if reason and reason != record.reason:
-                            record.reason = reason
-                            record.bump()
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[VISIBILITY] Warning: failed to query {provider.label}: {exc}", file=sys.stderr)
+                        if not tx_hash:
+                            continue
+                        tx_hash = str(tx_hash).lower()
+                        if tx_hash not in observed_all:
+                            observed_all.add(tx_hash)
+                            if output_handle and tx_hash not in written_observed:
+                                write_event(output_handle, now, tx_hash, "observed", provider.label)
+                                written_observed.add(tx_hash)
 
-            for record in records.values():
-                if record.status in {"mined", "mined_failed", "rejected"}:
-                    continue
-                primary = providers[0]
-                try:
-                    receipt = primary.w3.eth.get_transaction_receipt(record.tx_hash)
-                except TransactionNotFound:
-                    receipt = None
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[VISIBILITY] Warning: receipt lookup failed: {exc}", file=sys.stderr)
-                    receipt = None
-                if receipt is not None:
-                    status = receipt.get("status")
-                    record.set_receipt(status, now)
-                    record.bump()
-                    continue
-                if now - record.last_seen >= args.reject_window:
-                    reason = record.reason or "timeout"
-                    record.mark_status("rejected", now, reason)
+                        data_field = tx.get("input") or tx.get("data") or "0x"
+                        if marker_matches(marker, data_field):
+                            if tx_hash not in observed_marked:
+                                observed_marked.add(tx_hash)
+                                if output_handle and tx_hash not in written_marked:
+                                    write_event(output_handle, now, tx_hash, "marked", provider.label)
+                                    written_marked.add(tx_hash)
 
-            for record in records.values():
-                if record.version > record.last_write_version and output_handle:
-                    payload = record.to_payload(time.time())
-                    json.dump(payload, output_handle, ensure_ascii=False)
-                    output_handle.write("\n")
-                    output_handle.flush()
-                    record.last_write_version = record.version
-
-            if time.time() - last_summary >= args.summary_interval:
-                log_summary(records)
-                last_summary = time.time()
-
-            time.sleep(max(args.poll, 0.5))
+                time.sleep(max(args.poll, 0.5))
     except KeyboardInterrupt:
-        log_summary(records)
+        ground_truth = load_ground_truth(args.ground_truth)
+        metrics = compute_metrics(ground_truth, observed_all, observed_marked)
+        print("[METRICS] 指标统计：")
+        if not metrics["ground_truth"]:
+            print("  * 未提供 ground-truth，指标为下限估计")
+        print(f"  T_n = {metrics['T_n']} (真实恶意交易数)")
+        print(f"  A_n = {metrics['A_n']} (识别出的恶意交易数)")
+        print(f"  N_n = {metrics['N_n']} (未识别的恶意交易数)")
+        print(f"  P_n = {metrics['P_n']} (误报的正常交易数)")
+        print(f"  C_n = {metrics['C_n']} (观测到的正常交易数)")
+        print(f"  DC  = {format_ratio(metrics['DC'])}")
+        print(f"  AFP = {format_ratio(metrics['AFP'])}")
+        print(f"  AFN = {format_ratio(metrics['AFN'])}")
+        if output_handle:
+            snapshot = {
+                "timestamp": time.time(),
+                "metrics": metrics,
+            }
+            json.dump(snapshot, output_handle, ensure_ascii=False)
+            output_handle.write("\n")
+            output_handle.flush()
     finally:
         if output_handle:
             output_handle.close()
