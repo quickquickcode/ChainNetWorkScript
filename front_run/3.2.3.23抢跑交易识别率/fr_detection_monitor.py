@@ -261,10 +261,10 @@ def run_detection(
         if detection_fp:
             detection_fp.write(json.dumps(detection_payload, ensure_ascii=True) + "\n")
             detection_fp.flush()
-        print(
-            f"[DETECT] pair={pair_id} victim={victim.tx_hash} runner={runner.tx_hash} "
-            f"delay={detection_payload['detected_delay']:.3f}s"
-        )
+        # print(
+        #     f"[DETECT] pair={pair_id} victim={victim.tx_hash} runner={runner.tx_hash} "
+        #     f"delay={detection_payload['detected_delay']:.3f}s"
+        # )
         victims.pop(pair_id, None)
         runners.pop(pair_id, None)
 

@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""Monitor hot-contract front-running rate based on trigger output."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import queue
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Set
+
+from web3 import Web3
+
+PIPE_TX_SCHEMAS = {"fr-hotspot-tx-v1", "fr-trigger-tx-v1"}
+PIPE_META_SCHEMA = "fr-hotspot-metadata-v1"
+GROUND_TRUTH_SCHEMAS = {"fr-hotspot-event-v1", "fr-trigger-event-v1"}
+
+
+@dataclass
+class EventInfo:
+    pair_id: int
+    event_id: Optional[str] = None
+    target_address: Optional[str] = None
+    first_seen: Optional[float] = None
+    truth_is_hot: Optional[bool] = None
+    detected_hot: Optional[bool] = None
+    counted: bool = False
+
+
+class GroundTruthFollower:
+    def __init__(self, path: Path):
+        self.path = path
+        self.position = 0
+
+    def read_new(self) -> List[Dict[str, object]]:
+        if not self.path.exists():
+            return []
+        with self.path.open("r", encoding="utf-8") as handle:
+            handle.seek(self.position)
+            lines = handle.readlines()
+            self.position = handle.tell()
+        payloads: List[Dict[str, object]] = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                payloads.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return payloads
+
+
+class HotList:
+    def __init__(self, path: Path):
+        self.path = path
+        self.addresses: set[str] = set()
+        self.mtime: Optional[float] = None
+        self.reload(force=True)
+
+    def reload(self, force: bool = False) -> None:
+        if not self.path:
+            return
+        try:
+            mtime = os.path.getmtime(self.path)
+        except OSError:
+            if force:
+                print(f"[WARN] hot list file {self.path} not found; using empty set")
+            self.addresses = set()
+            self.mtime = None
+            return
+        if not force and self.mtime == mtime:
+            return
+        entries: set[str] = set()
+        with self.path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                entries.add(stripped.lower())
+        self.addresses = entries
+        self.mtime = mtime
+        print(f"[INFO] loaded {len(entries)} hot addresses from {self.path}")
+
+    def is_hot(self, address: Optional[str]) -> Optional[bool]:
+        if not address:
+            return None
+        return address.lower() in self.addresses
+
+
+def pipe_listener(pipe_path: Path, sink: queue.Queue, stop_flag: threading.Event) -> None:
+    while not stop_flag.is_set():
+        try:
+            with pipe_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if stop_flag.is_set():
+                        return
+                    if not line.strip():
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    schema = payload.get("schema")
+                    if schema not in PIPE_TX_SCHEMAS and schema != PIPE_META_SCHEMA:
+                        continue
+                    sink.put(payload)
+        except FileNotFoundError:
+            time.sleep(1)
+        except OSError:
+            time.sleep(0.5)
+
+
+def apply_ground_truth(payloads: Iterable[Dict[str, object]], states: Dict[int, EventInfo]) -> None:
+    for payload in payloads:
+        if payload.get("schema") not in GROUND_TRUTH_SCHEMAS:
+            continue
+        try:
+            pair_id = int(payload.get("pair_id", 0))
+        except (ValueError, TypeError):
+            continue
+        if pair_id <= 0:
+            continue
+        state = states.setdefault(pair_id, EventInfo(pair_id=pair_id))
+        state.event_id = payload.get("event_id", state.event_id)
+        state.target_address = payload.get("target_address", state.target_address)
+        if "is_hot_truth" in payload:
+            value = payload.get("is_hot_truth")
+            if value is not None:
+                state.truth_is_hot = bool(value)
+
+
+def apply_pipe(
+    payload: Dict[str, object],
+    states: Dict[int, EventInfo],
+    truth_hot_contracts: Set[str],
+    truth_metadata: Dict[str, object],
+) -> None:
+    schema = payload.get("schema")
+    if schema == PIPE_META_SCHEMA:
+        truth_hot_contracts.clear()
+        hot_entries = payload.get("hot_contracts") or []
+        if payload.get("hot_contract"):
+            hot_entries.append(payload["hot_contract"])
+        for addr in hot_entries:
+            try:
+                checksum = Web3.to_checksum_address(addr)
+            except Exception:  # noqa: BLE001
+                continue
+            truth_hot_contracts.add(checksum.lower())
+        truth_metadata["hot_contracts"] = sorted(truth_hot_contracts)
+        truth_metadata["timestamp"] = payload.get("timestamp", time.time())
+        if payload.get("targets"):
+            truth_metadata["targets"] = payload.get("targets")
+        return
+    if schema not in PIPE_TX_SCHEMAS:
+        return
+    try:
+        pair_id = int(payload.get("pair_id", 0))
+    except (ValueError, TypeError):
+        return
+    if pair_id <= 0:
+        return
+    state = states.setdefault(pair_id, EventInfo(pair_id=pair_id))
+    state.first_seen = state.first_seen or float(payload.get("timestamp", time.time()))
+    role = payload.get("role")
+    if role in {"victim", "runner"}:
+        to_address = payload.get("to")
+        if to_address:
+            state.target_address = to_address
+    if "is_hot_truth" in payload:
+        value = payload.get("is_hot_truth")
+        if value is not None:
+            state.truth_is_hot = bool(value)
+    if state.truth_is_hot is None and state.target_address:
+        lower = state.target_address.lower()
+        if truth_hot_contracts:
+            state.truth_is_hot = lower in truth_hot_contracts
+
+
+def ensure_output(path: Optional[Path]):
+    if not path:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path.open("a", encoding="utf-8")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Monitor hot contract front-running rate")
+    parser.add_argument("--pipe", type=Path, required=True, help="FIFO path emitted by trigger")
+    parser.add_argument("--ground-truth", type=Path, required=True, help="Ground-truth JSONL file")
+    parser.add_argument("--hot-contracts", type=Path, required=True, help="Hot contract address list")
+    parser.add_argument("--list-version", default="unknown", help="Hot list version identifier")
+    parser.add_argument("--status-interval", type=float, default=10.0, help="Seconds between status logs")
+    parser.add_argument("--output", type=Path, help="Per-event JSONL output path")
+    parser.add_argument("--refresh-interval", type=float, default=30.0, help="Seconds between hot list reloads")
+    args = parser.parse_args()
+
+    hot_list = HotList(args.hot_contracts)
+    gt_follower = GroundTruthFollower(args.ground_truth)
+    states: Dict[int, EventInfo] = {}
+    truth_hot_contracts: Set[str] = set()
+    truth_metadata: Dict[str, object] = {}
+    stats = {
+        "total": 0,
+        "truth_hot": 0,
+        "detected_hot": 0,
+        "true_positive": 0,
+        "false_positive": 0,
+        "false_negative": 0,
+    }
+    per_target: Dict[str, Dict[str, int]] = {}
+
+    output_fp = ensure_output(args.output)
+
+    stop_flag = threading.Event()
+    pipe_queue: "queue.Queue[Dict[str, object]]" = queue.Queue()
+    listener = threading.Thread(target=pipe_listener, args=(args.pipe, pipe_queue, stop_flag), daemon=True)
+    listener.start()
+
+    last_status = 0.0
+    last_refresh = 0.0
+
+    def record_state(state: EventInfo) -> None:
+        if state.counted:
+            return
+        if state.truth_is_hot is None or state.detected_hot is None:
+            return
+        state.counted = True
+        stats["total"] += 1
+        if state.truth_is_hot:
+            stats["truth_hot"] += 1
+        if state.detected_hot:
+            stats["detected_hot"] += 1
+        if state.truth_is_hot and state.detected_hot:
+            stats["true_positive"] += 1
+        elif state.truth_is_hot and not state.detected_hot:
+            stats["false_negative"] += 1
+        elif not state.truth_is_hot and state.detected_hot:
+            stats["false_positive"] += 1
+        target = (state.target_address or "0x").lower()
+        slot = per_target.setdefault(target, {"truth": 0, "detected": 0, "mismatch": 0})
+        if state.truth_is_hot:
+            slot["truth"] += 1
+        if state.detected_hot:
+            slot["detected"] += 1
+        if state.truth_is_hot != state.detected_hot:
+            slot["mismatch"] += 1
+        if output_fp:
+            payload = {
+                "pair_id": state.pair_id,
+                "event_id": state.event_id,
+                "target_address": state.target_address,
+                "truth_is_hot": state.truth_is_hot,
+                "detected_hot": state.detected_hot,
+                "match": state.truth_is_hot == state.detected_hot,
+                "list_version": args.list_version,
+                "first_seen": state.first_seen,
+                "truth_metadata": truth_metadata,
+                "timestamp": time.time(),
+            }
+            output_fp.write(json.dumps(payload, ensure_ascii=True) + "\n")
+            output_fp.flush()
+
+    try:
+        # Prime with existing ground truth data
+        apply_ground_truth(gt_follower.read_new(), states)
+        while True:
+            # FIFO events
+            while True:
+                try:
+                    payload = pipe_queue.get_nowait()
+                except queue.Empty:
+                    break
+                apply_pipe(payload, states, truth_hot_contracts, truth_metadata)
+            # Ground truth tail
+            apply_ground_truth(gt_follower.read_new(), states)
+
+            now = time.time()
+            # Maybe refresh hot list
+            if now - last_refresh >= args.refresh_interval:
+                hot_list.reload()
+                last_refresh = now
+
+            for state in list(states.values()):
+                if state.truth_is_hot is None and state.target_address and truth_hot_contracts:
+                    state.truth_is_hot = state.target_address.lower() in truth_hot_contracts
+                if state.detected_hot is None and state.target_address:
+                    detection = hot_list.is_hot(state.target_address)
+                    if detection is not None:
+                        state.detected_hot = detection
+                record_state(state)
+
+            if now - last_status >= args.status_interval:
+                last_status = now
+                total = stats["total"]
+                hot = stats["truth_hot"]
+                detected = stats["detected_hot"]
+                rate = hot / total if total else 0.0
+                precision = (
+                    stats["true_positive"] / detected if detected else 0.0
+                )
+                recall = (
+                    stats["true_positive"] / hot if hot else 0.0
+                )
+                print(
+                    f"[STATUS] total={total} truth_hot={hot} detected_hot={detected} "
+                    f"hot_rate={rate:.3f} precision={precision:.3f} recall={recall:.3f} "
+                    f"version={args.list_version}"
+                )
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_flag.set()
+        listener.join(timeout=1.0)
+        if output_fp:
+            output_fp.close()
+        total = stats["total"]
+        hot = stats["truth_hot"]
+        detected = stats["detected_hot"]
+        rate = hot / total if total else 0.0
+        precision = stats["true_positive"] / detected if detected else 0.0
+        recall = stats["true_positive"] / hot if hot else 0.0
+        print(
+            f"[SUMMARY] total={total} truth_hot={hot} detected_hot={detected} "
+            f"hot_rate={rate:.3f} precision={precision:.3f} recall={recall:.3f} "
+            f"fp={stats['false_positive']} fn={stats['false_negative']} "
+            f"version={args.list_version}"
+        )
+        top_items = sorted(per_target.items(), key=lambda kv: kv[1]["truth"] + kv[1]["detected"], reverse=True)[
+            :10
+        ]
+        for address, bucket in top_items:
+            print(
+                "  - {}: truth={} detected={} mismatch={}".format(
+                    address,
+                    bucket["truth"],
+                    bucket["detected"],
+                    bucket["mismatch"],
+                )
+            )
+
+
+if __name__ == "__main__":
+    main()
