@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+"""Unified front-running trigger with ground-truth JSONL and optional pipe streaming."""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import hashlib
+import itertools
+import json
+import os
+import sys
+import time
+from dataclasses import dataclass
+from decimal import Decimal
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+from eth_account import Account
+from eth_account.signers.local import LocalAccount
+from web3 import Web3
+from web3.types import TxParams
+
+DEFAULT_CONTRACT_BYTECODE = (
+    "0x6080604052348015600f57600080fd5b5060c58061001e6000396000f3fe6080604052"
+    "6004361060455760003560e01c8063c0e317fb14604a575b600080fd5b606a600480360360"
+    "20811015605e57600080fd5b50356088565b60408051918252519081900360200190f35b60"
+    "006000546001600160a01b03168156fea2646970667358221220645c41fbbf21ceae5fa18c"
+    "f6d2d4c2de142c8f869f4f6fee577e0722b8aaabf364736f6c63430008160033"
+)
+
+PIPE_SCHEMA_VERSION = "fr-trigger-tx-v1"
+GROUND_TRUTH_SCHEMA_VERSION = "fr-trigger-event-v1"
+
+
+def positive_int(value: str) -> int:
+    ivalue = int(value, 0)
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return ivalue
+
+
+def non_negative_int(value: str) -> int:
+    ivalue = int(value, 0)
+    if ivalue < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return ivalue
+
+
+def parse_wei_amount(value: str) -> int:
+    text = value.strip().lower()
+    if text.endswith("gwei"):
+        amount = Decimal(text[:-4]) * Decimal(10**9)
+    elif text.endswith("wei"):
+        amount = Decimal(text[:-3])
+    elif text.endswith("eth"):
+        amount = Decimal(text[:-3]) * Decimal(10**18)
+    else:
+        amount = Decimal(text)
+    result = int(amount)
+    if result < 0:
+        raise argparse.ArgumentTypeError("amount must be non-negative")
+    return result
+
+
+def parse_marker(value: str) -> bytes:
+    if not value.startswith("0x"):
+        raise argparse.ArgumentTypeError("marker must start with 0x")
+    hex_part = value[2:]
+    if len(hex_part) % 2 != 0:
+        raise argparse.ArgumentTypeError("marker hex length must be even")
+    try:
+        return bytes.fromhex(hex_part)
+    except ValueError as exc:  # noqa: B904
+        raise argparse.ArgumentTypeError(f"invalid hex marker: {exc}") from exc
+
+
+@dataclass
+class ManagedAccount:
+    label: str
+    local: LocalAccount
+    nonce: Optional[int] = None
+
+    @property
+    def address(self) -> str:
+        return Web3.to_checksum_address(self.local.address)
+
+    def acquire_nonce(self, w3: Web3) -> int:
+        if self.nonce is None:
+            self.nonce = w3.eth.get_transaction_count(self.address, "pending")
+        nonce = self.nonce
+        self.nonce += 1
+        return nonce
+
+
+class OutputChannels:
+    def __init__(self, ground_truth_path: Optional[Path], pipe_path: Optional[Path]):
+        self._ground_truth = None
+        self._pipe = None
+        if ground_truth_path:
+            ground_truth_path.parent.mkdir(parents=True, exist_ok=True)
+            self._ground_truth = ground_truth_path.open("a", encoding="utf-8")
+        if pipe_path:
+            self._pipe = self._open_pipe(pipe_path)
+
+    def close(self) -> None:
+        if self._ground_truth:
+            self._ground_truth.close()
+            self._ground_truth = None
+        if self._pipe:
+            self._pipe.close()
+            self._pipe = None
+
+    def write_ground_truth(self, record: Dict[str, object]) -> None:
+        line = json.dumps(record, ensure_ascii=True)
+        if self._ground_truth:
+            self._ground_truth.write(line + "\n")
+            self._ground_truth.flush()
+        else:
+            print(line)
+
+    def write_pipe(self, record: Dict[str, object]) -> None:
+        if not self._pipe:
+            return
+        line = json.dumps(record, ensure_ascii=True)
+        try:
+            self._pipe.write(line + "\n")
+            self._pipe.flush()
+        except BrokenPipeError:
+            print("[PIPE] consumer disconnected; disabling pipe output", file=sys.stderr)
+            self._pipe.close()
+            self._pipe = None
+
+    @staticmethod
+    def _open_pipe(pipe_path: Path):
+        if os.name == "nt":  # pragma: no cover - Windows named pipes need alternative handling
+            raise SystemExit("Named pipe streaming currently requires POSIX platforms")
+        if pipe_path.exists() and not pipe_path.is_fifo():
+            raise SystemExit(f"--pipe target {pipe_path} exists but is not a FIFO")
+        if not pipe_path.exists():
+            os.mkfifo(pipe_path, 0o660)
+        deadline = time.time() + 10
+        while True:
+            try:
+                fd = os.open(str(pipe_path), os.O_WRONLY | os.O_NONBLOCK)
+                break
+            except OSError as exc:  # noqa: PERF203
+                if exc.errno != errno.ENXIO:
+                    raise
+                if time.time() >= deadline:
+                    raise SystemExit("Timed out waiting for pipe consumer to connect") from exc
+                time.sleep(0.5)
+        return os.fdopen(fd, "w", buffering=1, encoding="utf-8")
+
+
+def cycle(items: Sequence[Web3]) -> Iterable[Web3]:
+    return itertools.cycle(items)
+
+
+def load_master_account(args: argparse.Namespace) -> ManagedAccount:
+    keystore_blob = os.getenv("ATTACKER_KEYSTORE")
+    if not keystore_blob:
+        raise SystemExit("ATTACKER_KEYSTORE environment variable not set")
+    try:
+        keystore_json = json.loads(keystore_blob)
+    except json.JSONDecodeError as exc:  # noqa: B904
+        raise SystemExit(f"Failed to parse ATTACKER_KEYSTORE JSON: {exc}") from exc
+
+    passphrase = args.passphrase
+    if passphrase is None:
+        from getpass import getpass
+
+        passphrase = getpass("Keystore passphrase: ")
+
+    try:
+        private_key = Account.decrypt(keystore_json, passphrase)
+    except ValueError as exc:  # noqa: B904
+        raise SystemExit(f"Keystore decryption failed: {exc}") from exc
+
+    local = Account.from_key(private_key)
+    return ManagedAccount(label="master", local=local)
+
+
+def generate_child_accounts(target_total: int) -> List[ManagedAccount]:
+    accounts: List[ManagedAccount] = []
+    for index in range(target_total):
+        local = Account.create()
+        accounts.append(ManagedAccount(label=f"child-{index+1}", local=local))
+    return accounts
+
+
+def ensure_providers(rpc_urls: List[str]) -> Tuple[List[Web3], int]:
+    if not rpc_urls:
+        raise SystemExit("At least one --rpc endpoint is required")
+    providers: List[Web3] = []
+    for url in rpc_urls:
+        provider = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 30}))
+        if not provider.is_connected():
+            raise SystemExit(f"Failed to connect to RPC endpoint {url}")
+        providers.append(provider)
+    chain_id = providers[0].eth.chain_id
+    return providers, chain_id
+
+
+def ensure_balance(provider: Web3, address: str, minimum_wei: int) -> None:
+    balance = provider.eth.get_balance(address)
+    if balance < minimum_wei:
+        raise SystemExit(
+            f"Master account {address} has insufficient balance ({balance} wei < {minimum_wei} wei)"
+        )
+
+
+def send_signed_transaction(
+    provider: Web3,
+    account: ManagedAccount,
+    tx: TxParams,
+    dry_run: bool,
+) -> Tuple[str, Optional[bytes]]:
+    if dry_run:
+        fake = f"0xDRYRUN{hashlib.sha1(repr(tx).encode('ascii')).hexdigest()[:32]}"
+        return fake, None
+    signed = account.local.sign_transaction(tx)
+    tx_hash = provider.eth.send_raw_transaction(signed.rawTransaction)
+    return tx_hash.hex(), signed.rawTransaction
+
+
+def wait_for_receipt(provider: Web3, tx_hash: str, timeout: int) -> str:
+    receipt = provider.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+    contract_address = receipt.get("contractAddress")
+    if not contract_address:
+        raise SystemExit(f"Deployment transaction {tx_hash} did not return a contract address")
+    return Web3.to_checksum_address(contract_address)
+
+
+def stream_prefill(
+    providers: Sequence[Web3],
+    accounts: Sequence[ManagedAccount],
+    args: argparse.Namespace,
+    channels: OutputChannels,
+    chain_id: int,
+    base_gas_price: int,
+) -> None:
+    if args.prefill_normal <= 0:
+        return
+    marker_bytes = parse_marker(args.prefill_marker)
+    provider_iter = cycle(providers)
+    target = accounts[0].address
+    print(f"[PREFILL] sending {args.prefill_normal} warm-up transactions")
+    for idx in range(args.prefill_normal):
+        account = accounts[idx % len(accounts)]
+        provider = next(provider_iter)
+        nonce = account.acquire_nonce(provider)
+        payload = marker_bytes + b"\x00" + (idx + 1).to_bytes(4, "big")
+        tx: TxParams = {
+            "chainId": chain_id,
+            "nonce": nonce,
+            "to": target,
+            "value": 0,
+            "gas": args.prefill_gas,
+            "gasPrice": base_gas_price,
+            "data": payload,
+        }
+        tx_hash, _ = send_signed_transaction(provider, account, tx, args.dry_run)
+        record = {
+            "schema": PIPE_SCHEMA_VERSION,
+            "role": "prefill",
+            "prefill_id": idx + 1,
+            "tx_hash": tx_hash,
+            "from": account.address,
+            "to": target,
+            "gas": args.prefill_gas,
+            "gas_price": base_gas_price,
+            "input_marker": args.prefill_marker,
+            "timestamp": time.time(),
+        }
+        channels.write_pipe(record)
+        print(
+            f"[PREFILL] idx={idx + 1}/{args.prefill_normal} hash={tx_hash} from={account.address} nonce={nonce}"
+        )
+        if idx + 1 < args.prefill_normal:
+            time.sleep(max(args.interval, 0.0))
+
+
+def fund_child_accounts(
+    providers: Sequence[Web3],
+    master: ManagedAccount,
+    children: Sequence[ManagedAccount],
+    chain_id: int,
+    args: argparse.Namespace,
+) -> None:
+    if not children or args.fund_amount == 0:
+        return
+    provider_iter = cycle(providers)
+    for child in children:
+        provider = next(provider_iter)
+        nonce = master.acquire_nonce(provider)
+        tx: TxParams = {
+            "chainId": chain_id,
+            "nonce": nonce,
+            "to": child.address,
+            "value": args.fund_amount,
+            "gas": args.fund_gas,
+            "gasPrice": args.victim_gas_price,
+        }
+        tx_hash, _ = send_signed_transaction(provider, master, tx, args.dry_run)
+        print(
+            f"[FUND] child={child.address} value={args.fund_amount} wei hash={tx_hash} nonce={nonce}"
+        )
+        if not args.dry_run:
+            _ = provider.eth.wait_for_transaction_receipt(tx_hash, timeout=args.receipt_timeout)
+            waited = _balance_wait(provider, child.address, args.fund_amount, args.balance_timeout)
+            if not waited:
+                raise SystemExit(f"Timed out waiting for balance on {child.address}")
+
+
+def _balance_wait(provider: Web3, address: str, target: int, timeout: int) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if provider.eth.get_balance(address) >= target:
+            return True
+        time.sleep(2)
+    return False
+
+
+def deploy_contracts(
+    providers: Sequence[Web3],
+    master: ManagedAccount,
+    chain_id: int,
+    args: argparse.Namespace,
+) -> List[str]:
+    if args.contracts <= 0:
+        return []
+    provider_iter = cycle(providers)
+    deployed: List[str] = []
+    print(f"[DEPLOY] deploying {args.contracts} helper contracts")
+    for idx in range(args.contracts):
+        provider = next(provider_iter)
+        nonce = master.acquire_nonce(provider)
+        tx: TxParams = {
+            "chainId": chain_id,
+            "nonce": nonce,
+            "to": None,
+            "value": 0,
+            "gas": args.contract_gas,
+            "gasPrice": args.victim_gas_price,
+            "data": DEFAULT_CONTRACT_BYTECODE,
+        }
+        tx_hash, _ = send_signed_transaction(provider, master, tx, args.dry_run)
+        if args.dry_run:
+            contract_address = f"0xDRYCONTRACT{idx:02X}".ljust(42, "0")
+        else:
+            contract_address = wait_for_receipt(provider, tx_hash, args.receipt_timeout)
+        deployed.append(contract_address)
+        print(f"[DEPLOY] idx={idx + 1}/{args.contracts} address={contract_address} hash={tx_hash}")
+        time.sleep(max(args.interval, 0.0))
+    return deployed
+
+
+def build_payload(marker: bytes, role_tag: int, pair_id: int) -> bytes:
+    return marker + role_tag.to_bytes(1, "big") + pair_id.to_bytes(4, "big")
+
+
+def choose_account_pair(accounts: Sequence[ManagedAccount], index: int) -> Tuple[ManagedAccount, ManagedAccount]:
+    victim = accounts[index % len(accounts)]
+    runner = accounts[(index + 1) % len(accounts)]
+    if victim.address == runner.address and len(accounts) > 1:
+        runner = accounts[(index + 2) % len(accounts)]
+    return victim, runner
+
+
+def aggregate_hash(victim_hash: str, runner_hash: str) -> str:
+    digest = hashlib.sha1((victim_hash + runner_hash).encode("ascii")).hexdigest()
+    return digest[:16]
+
+
+def run_pairs(
+    providers: Sequence[Web3],
+    accounts: Sequence[ManagedAccount],
+    contracts: Sequence[str],
+    args: argparse.Namespace,
+    channels: OutputChannels,
+    chain_id: int,
+) -> None:
+    marker_bytes = parse_marker(args.marker)
+    provider_iter = cycle(providers)
+    contract_iter = itertools.cycle(contracts) if contracts else None
+
+    for pair_id in range(1, args.count + 1):
+        victim_account, runner_account = choose_account_pair(accounts, pair_id - 1)
+        provider_victim = next(provider_iter)
+        provider_runner = next(provider_iter)
+        victim_nonce = victim_account.acquire_nonce(provider_victim)
+        runner_nonce = runner_account.acquire_nonce(provider_runner)
+
+        if args.victim_contract:
+            target = Web3.to_checksum_address(args.victim_contract)
+        elif contract_iter:
+            target = Web3.to_checksum_address(next(contract_iter))
+        else:
+            target = Web3.to_checksum_address(victim_account.address)
+
+        victim_payload = build_payload(marker_bytes, 1, pair_id)
+        runner_payload = build_payload(marker_bytes, 2, pair_id)
+
+        victim_tx: TxParams = {
+            "chainId": chain_id,
+            "nonce": victim_nonce,
+            "to": target,
+            "value": args.transfer_amount,
+            "gas": args.victim_gas,
+            "gasPrice": args.victim_gas_price,
+            "data": victim_payload,
+        }
+        runner_tx: TxParams = {
+            "chainId": chain_id,
+            "nonce": runner_nonce,
+            "to": target,
+            "value": args.transfer_amount,
+            "gas": args.runner_gas,
+            "gasPrice": args.victim_gas_price + args.runner_premium,
+            "data": runner_payload,
+        }
+
+        victim_hash, _ = send_signed_transaction(provider_victim, victim_account, victim_tx, args.dry_run)
+        runner_hash, _ = send_signed_transaction(provider_runner, runner_account, runner_tx, args.dry_run)
+
+        event_id = aggregate_hash(victim_hash, runner_hash)
+        timestamp = time.time()
+        ground_truth = {
+            "schema": GROUND_TRUTH_SCHEMA_VERSION,
+            "event_id": event_id,
+            "pair_id": pair_id,
+            "victim_hash": victim_hash,
+            "runner_hash": runner_hash,
+            "victim_address": victim_account.address,
+            "runner_address": runner_account.address,
+            "target_address": target,
+            "victim_nonce": victim_nonce,
+            "runner_nonce": runner_nonce,
+            "victim_gas_price": args.victim_gas_price,
+            "runner_gas_price": args.victim_gas_price + args.runner_premium,
+            "marker": args.marker,
+            "pattern": args.pattern,
+            "timestamp": timestamp,
+        }
+        channels.write_ground_truth(ground_truth)
+
+        victim_stream = {
+            "schema": PIPE_SCHEMA_VERSION,
+            "pair_id": pair_id,
+            "role": "victim",
+            "tx_hash": victim_hash,
+            "from": victim_account.address,
+            "to": target,
+            "nonce": victim_nonce,
+            "gas": args.victim_gas,
+            "gas_price": args.victim_gas_price,
+            "input_marker": args.marker,
+            "timestamp": timestamp,
+        }
+        runner_stream = {
+            "schema": PIPE_SCHEMA_VERSION,
+            "pair_id": pair_id,
+            "role": "runner",
+            "tx_hash": runner_hash,
+            "from": runner_account.address,
+            "to": target,
+            "nonce": runner_nonce,
+            "gas": args.runner_gas,
+            "gas_price": args.victim_gas_price + args.runner_premium,
+            "input_marker": args.marker,
+            "timestamp": timestamp,
+        }
+        channels.write_pipe(victim_stream)
+        channels.write_pipe(runner_stream)
+
+        print(
+            "[PAIR] id={}/{} victim_hash={} runner_hash={} victim={} runner={}".format(
+                pair_id,
+                args.count,
+                victim_hash,
+                runner_hash,
+                victim_account.address,
+                runner_account.address,
+            )
+        )
+        if pair_id < args.count:
+            time.sleep(max(args.interval, 0.0))
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate controlled front-running pairs")
+    parser.add_argument("--rpc", action="append", help="HTTP RPC endpoint; repeatable", required=True)
+    parser.add_argument("--count", type=positive_int, default=100, help="Number of victim/runner pairs to emit")
+    parser.add_argument("--marker", default="0xfeedface", help="Marker prefix for calldata")
+    parser.add_argument("--runner-premium", default="30gwei", type=parse_wei_amount, help="Runner gas price premium over victim")
+    parser.add_argument("--victim-gas-price", default="0", type=parse_wei_amount, help="Explicit victim gas price; 0 fetches node suggestion")
+    parser.add_argument("--victim-gas", type=positive_int, default=120000, help="Gas limit for victim transactions")
+    parser.add_argument("--runner-gas", type=positive_int, default=120000, help="Gas limit for runner transactions")
+    parser.add_argument("--transfer-amount", type=parse_wei_amount, default="0", help="ETH value (wei) attached to victim/runner tx")
+    parser.add_argument("--pattern", choices=["single"], default="single", help="Front-running pattern (currently only single supported)")
+    parser.add_argument("--accounts", type=positive_int, default=2, help="Total sender accounts including master (min 2 recommended)")
+    parser.add_argument("--fund-amount", type=parse_wei_amount, default="0.05eth", help="Funding amount per generated child account")
+    parser.add_argument("--fund-gas", type=positive_int, default=21000, help="Gas limit for funding transfers")
+    parser.add_argument("--prefill-normal", type=non_negative_int, default=100, help="Number of warm-up transactions to send")
+    parser.add_argument("--prefill-marker", default="0x00000000", help="Calldata prefix for warm-up transactions")
+    parser.add_argument("--prefill-gas", type=positive_int, default=60000, help="Gas limit per warm-up transaction")
+    parser.add_argument("--skip-prefill", action="store_true", help="Skip warm-up stage")
+    parser.add_argument("--prefill-only", action="store_true", help="Only run warm-up stage and exit")
+    parser.add_argument("--contracts", type=non_negative_int, default=0, help="Number of helper contracts to deploy")
+    parser.add_argument("--contract-gas", type=positive_int, default=550000, help="Gas limit used for helper contract deployment")
+    parser.add_argument("--victim-contract", help="Override victim target address (checksum format)")
+    parser.add_argument("--interval", type=float, default=0.05, help="Delay between consecutive sends")
+    parser.add_argument("--output", help="Ground-truth JSONL path")
+    parser.add_argument("--pipe", help="Named pipe path for realtime streaming")
+    parser.add_argument("--dry-run", action="store_true", help="Plan transactions without broadcasting")
+    parser.add_argument("--chain-id", type=positive_int, help="Override chain ID")
+    parser.add_argument("--passphrase", help="Passphrase for ATTACKER_KEYSTORE; prompts when omitted")
+    parser.add_argument("--receipt-timeout", type=positive_int, default=120, help="Seconds to wait for deployment receipts")
+    parser.add_argument("--balance-timeout", type=positive_int, default=120, help="Seconds to wait for child balance funding")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_arguments()
+    providers, provider_chain_id = ensure_providers(args.rpc)
+    base_provider = providers[0]
+
+    master_account = load_master_account(args)
+    print(f"[MASTER] loaded {master_account.address}")
+
+    if args.victim_gas_price == 0:
+        args.victim_gas_price = base_provider.eth.gas_price
+        print(f"[GAS] victim gas price auto-set to {args.victim_gas_price} wei from node suggestion")
+
+    ensure_balance(base_provider, master_account.address, args.fund_amount * max(args.accounts - 1, 0) + 10**16)
+
+    total_accounts = max(args.accounts, 2)
+    child_needed = total_accounts - 1
+    child_accounts = generate_child_accounts(child_needed)
+    all_accounts: List[ManagedAccount] = [master_account] + child_accounts
+
+    channels = OutputChannels(
+        Path(args.output) if args.output else None,
+        Path(args.pipe) if args.pipe else None,
+    )
+
+    try:
+        fund_child_accounts(providers, master_account, child_accounts, args.chain_id or provider_chain_id, args)
+        if not args.skip_prefill:
+            stream_prefill(
+                providers,
+                all_accounts,
+                args,
+                channels,
+                args.chain_id or provider_chain_id,
+                args.victim_gas_price,
+            )
+        if args.prefill_only:
+            print("[DONE] prefill-only run complete")
+            return
+
+        contract_addresses = deploy_contracts(
+            providers,
+            master_account,
+            args.chain_id or provider_chain_id,
+            args,
+        )
+
+        run_pairs(
+            providers,
+            all_accounts,
+            contract_addresses,
+            args,
+            channels,
+            args.chain_id or provider_chain_id,
+        )
+        print("[DONE] generated {} front-running pairs".format(args.count))
+    finally:
+        channels.close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Interrupted by user", file=sys.stderr)
+        sys.exit(130)
